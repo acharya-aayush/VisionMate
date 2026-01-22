@@ -1,0 +1,40 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.log
+
+# Dataset and models
+dataset/
+*.yml
+*.h5
+*.pkl
+*.ckpt
+
+# Node/JS
+node_modules/
+dist/
+build/
+.npm/
+.yarn/
+.pnpm-debug.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# Env files
+.env
+.env.*
+
+# Misc
+*.bak
+*.swp
+*.tmp

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import traceback
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -124,7 +124,12 @@ async def recognize_base64(data: dict):
         img = decode_base64_image(data.get("image", ""))
         results = recognizer.recognize(img)
         faces = [result_to_dict(r) for r in results]
-        return {"success": True, "faces": faces, "message": f"{len(faces)} face(s)"}
+        return {
+            "success": True,
+            "faces": faces,
+            "message": f"{len(faces)} face(s)",
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
         print(f"❌ Error in recognize_base64: {str(e)}")
         traceback.print_exc()
@@ -142,7 +147,12 @@ async def register_base64(data: dict):
         user_id = recognizer.get_next_user_id()
         
         if recognizer.add_face(img, user_id, name):
-            return {"success": True, "user_id": user_id, "user_name": name}
+            return {
+                "success": True,
+                "user_id": user_id,
+                "user_name": name,
+                "message": f"{name} registered successfully"
+            }
         raise HTTPException(400, "No face detected")
     except HTTPException:
         raise
@@ -151,10 +161,14 @@ async def register_base64(data: dict):
 
 
 @app.post("/train")
-async def train():
+async def train(max_samples: int = Query(default=50, ge=5, le=300)):
     try:
-        stats = recognizer.train()
-        return {"success": True, "stats": stats}
+        stats = recognizer.train(max_per_user=max_samples)
+        return {
+            "success": True,
+            "stats": stats,
+            "message": f"Training complete with up to {max_samples} samples per user"
+        }
     except Exception as e:
         raise HTTPException(500, str(e))
 

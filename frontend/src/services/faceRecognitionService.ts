@@ -3,9 +3,9 @@
  * Handles communication with Python FastAPI backend
  */
 
+import { API_BASE_URL, WS_URL } from "@/config/runtime";
+
 // API Configuration
-const API_BASE_URL = 'http://localhost:8000';
-const WS_URL = 'ws://localhost:8000/ws/recognize';
 
 // Types
 export interface FaceLocation {
@@ -27,7 +27,7 @@ export interface RecognitionResponse {
   success: boolean;
   faces: RecognizedFace[];
   message: string;
-  timestamp: string;
+  timestamp?: string;
 }
 
 export interface UserInfo {

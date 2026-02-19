@@ -1,14 +1,13 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
-import { Loader2, Camera, UserPlus, Users, Volume2, RefreshCw } from 'lucide-react';
+import { Loader2, Camera, UserPlus, Users, Volume2 } from 'lucide-react';
 import {
     checkAPIHealth,
     listUsers,
     recognizeFaceBase64,
     registerFaceBase64,
     RecognizedFace,
-    faceRecognitionSocket,
 } from '../services/faceRecognitionService';
 
 const FaceRecognition: React.FC = () => {
@@ -16,6 +15,8 @@ const FaceRecognition: React.FC = () => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const recognitionTimerRef = useRef<number | null>(null);
+    const recognitionLoopActiveRef = useRef(false);
 
     // State
     const [cameraActive, setCameraActive] = useState(false);
@@ -117,6 +118,11 @@ const FaceRecognition: React.FC = () => {
 
         // Cleanup on unmount
         return () => {
+            recognitionLoopActiveRef.current = false;
+            if (recognitionTimerRef.current !== null) {
+                window.clearTimeout(recognitionTimerRef.current);
+                recognitionTimerRef.current = null;
+            }
             if (videoRef.current && videoRef.current.srcObject) {
                 const stream = videoRef.current.srcObject as MediaStream;
                 stream.getTracks().forEach(track => track.stop());
@@ -166,9 +172,6 @@ const FaceRecognition: React.FC = () => {
                     title: "Camera Active",
                     description: "Face recognition is now running",
                 });
-
-                // Start recognition loop
-                startRecognitionLoop();
             }
 
         } catch (error) {
@@ -185,6 +188,12 @@ const FaceRecognition: React.FC = () => {
 
     // Stop camera
     const stopCamera = () => {
+        recognitionLoopActiveRef.current = false;
+        if (recognitionTimerRef.current !== null) {
+            window.clearTimeout(recognitionTimerRef.current);
+            recognitionTimerRef.current = null;
+        }
+
         if (videoRef.current?.srcObject) {
             const stream = videoRef.current.srcObject as MediaStream;
             stream.getTracks().forEach(track => track.stop());
@@ -221,10 +230,20 @@ const FaceRecognition: React.FC = () => {
         return canvas.toDataURL('image/jpeg', 0.8);
     }, []);
 
+    const clearRecognitionTimer = useCallback(() => {
+        if (recognitionTimerRef.current !== null) {
+            window.clearTimeout(recognitionTimerRef.current);
+            recognitionTimerRef.current = null;
+        }
+    }, []);
+
     // Recognition loop
     const startRecognitionLoop = useCallback(() => {
+        recognitionLoopActiveRef.current = true;
+        clearRecognitionTimer();
+
         const recognize = async () => {
-            if (!cameraActive) return;
+            if (!recognitionLoopActiveRef.current) return;
 
             const frame = captureFrame();
             if (frame) {
@@ -239,20 +258,28 @@ const FaceRecognition: React.FC = () => {
             }
 
             // Continue loop (every 500ms to avoid overwhelming the API)
-            if (cameraActive) {
-                setTimeout(recognize, 500);
+            if (recognitionLoopActiveRef.current) {
+                recognitionTimerRef.current = window.setTimeout(recognize, 500);
             }
         };
 
         recognize();
-    }, [cameraActive, captureFrame]);
+    }, [captureFrame, clearRecognitionTimer]);
 
     // Start loop when camera becomes active
     useEffect(() => {
         if (cameraActive) {
             startRecognitionLoop();
+        } else {
+            recognitionLoopActiveRef.current = false;
+            clearRecognitionTimer();
         }
-    }, [cameraActive, startRecognitionLoop]);
+
+        return () => {
+            recognitionLoopActiveRef.current = false;
+            clearRecognitionTimer();
+        };
+    }, [cameraActive, startRecognitionLoop, clearRecognitionTimer]);
 
     // Register new face
     const handleRegister = async () => {

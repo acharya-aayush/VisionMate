@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
-import { AudioLines, Loader2 } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 
 // Import our library scripts
 declare global {
@@ -23,43 +23,34 @@ const CameraView: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   
-  // Check if libraries are loaded
+  // Check if TensorFlow model globals are ready (loaded from index.html)
   useEffect(() => {
-    if (!window.handpose || !window.cocoSsd) {
-      // Load the required libraries
-      const loadHandpose = document.createElement('script');
-      loadHandpose.src = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js';
-      loadHandpose.async = true;
-      
-      const loadCocoSsd = document.createElement('script');
-      loadCocoSsd.src = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js';
-      loadCocoSsd.async = true;
-      
-      const loadTensorflow = document.createElement('script');
-      loadTensorflow.src = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@2.4.0/dist/tf.min.js';
-      loadTensorflow.async = true;
-      
-      document.body.appendChild(loadTensorflow);
-      document.body.appendChild(loadHandpose);
-      document.body.appendChild(loadCocoSsd);
-      
-      // Check when libraries are loaded
-      const checkLibraries = setInterval(() => {
-        if (window.handpose && window.cocoSsd) {
-          clearInterval(checkLibraries);
-          setModelsLoaded(true);
-          console.log("TensorFlow libraries loaded successfully");
-        }
-      }, 500);
-      
-      return () => {
+    let attempts = 0;
+    const maxAttempts = 30;
+
+    const checkLibraries = setInterval(() => {
+      attempts += 1;
+
+      if (window.handpose && window.cocoSsd) {
         clearInterval(checkLibraries);
-      };
-    } else {
-      setModelsLoaded(true);
-      console.log("TensorFlow libraries already loaded");
-    }
-  }, []);
+        setModelsLoaded(true);
+        return;
+      }
+
+      if (attempts >= maxAttempts) {
+        clearInterval(checkLibraries);
+        toast({
+          title: 'Model Load Timeout',
+          description: 'Could not load vision models. Please refresh and try again.',
+          variant: 'destructive',
+        });
+      }
+    }, 250);
+
+    return () => {
+      clearInterval(checkLibraries);
+    };
+  }, [toast]);
   
   // Function to convert text to speech
   const speak = (text: string) => {

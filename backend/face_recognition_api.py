@@ -12,9 +12,9 @@ import cv2
 import numpy as np
 import traceback
 from PIL import Image
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Form, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from simple_recognizer import SimpleFaceRecognizer, RecognitionResult
 
@@ -61,10 +61,20 @@ class UsersResponse(BaseModel):
     count: int
 
 
+class Base64ImageRequest(BaseModel):
+    image: str = Field(min_length=1)
+
+
+class RegisterFaceRequest(Base64ImageRequest):
+    user_name: str = Field(min_length=1, max_length=64)
+
+
 # Helpers
 def decode_base64_image(b64: str) -> np.ndarray:
     try:
-        # print(f"DEBUG: Received base64 length: {len(b64)}")
+        if not b64:
+            raise ValueError("Image payload is required")
+
         if ',' in b64:
             b64 = b64.split(',')[1]
         
@@ -116,9 +126,9 @@ async def list_users():
 
 
 @app.post("/recognize-base64")
-async def recognize_base64(data: dict):
+async def recognize_base64(data: Base64ImageRequest):
     try:
-        img = decode_base64_image(data.get("image", ""))
+        img = decode_base64_image(data.image)
         results = recognizer.recognize(img)
         faces = [result_to_dict(r) for r in results]
         return {
@@ -127,6 +137,8 @@ async def recognize_base64(data: dict):
             "message": f"{len(faces)} face(s)",
             "timestamp": datetime.now().isoformat()
         }
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         print(f"❌ Error in recognize_base64: {str(e)}")
         traceback.print_exc()
@@ -134,13 +146,13 @@ async def recognize_base64(data: dict):
 
 
 @app.post("/register-base64")
-async def register_base64(data: dict):
+async def register_base64(data: RegisterFaceRequest):
     try:
-        name = data.get("user_name", "").strip()
+        name = data.user_name.strip()
         if not name:
             raise HTTPException(400, "Name required")
         
-        img = decode_base64_image(data.get("image", ""))
+        img = decode_base64_image(data.image)
         user_id = recognizer.get_next_user_id()
         
         if recognizer.add_face(img, user_id, name):
@@ -151,6 +163,8 @@ async def register_base64(data: dict):
                 "message": f"{name} registered successfully"
             }
         raise HTTPException(400, "No face detected")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except HTTPException:
         raise
     except Exception as e:

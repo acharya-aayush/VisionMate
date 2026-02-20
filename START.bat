@@ -14,6 +14,6 @@ start "Backend" cmd /k "cd /d "%~dp0backend" && call venv\Scripts\activate.bat &
 timeout /t 3 /nobreak >nul
 start "Frontend" cmd /k "cd /d "%~dp0frontend" && npm run dev"
 timeout /t 5 /nobreak >nul
-start http://localhost:5173
+start http://localhost:8080
 echo VisionMate is running.
 pause

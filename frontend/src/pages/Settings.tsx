@@ -1,67 +1,40 @@
 
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
+import { useVisionSettings } from '@/hooks/useVisionSettings';
 
 const Settings: React.FC = () => {
   const { toast } = useToast();
-  const [fontSize, setFontSize] = useState(16);
-  const [highContrast, setHighContrast] = useState(false);
-  const [speakDetections, setSpeakDetections] = useState(true);
-  const [useReadAloud, setUseReadAloud] = useState(true);
-  const [cameraFacing, setCameraFacing] = useState('environment');
-  
-  useEffect(() => {
-    // Load saved settings
-    const savedFontSize = localStorage.getItem('fontSize');
-    if (savedFontSize) setFontSize(parseInt(savedFontSize));
-    
-    const savedHighContrast = localStorage.getItem('highContrast') === 'true';
-    setHighContrast(savedHighContrast);
-    if (savedHighContrast) {
-      document.body.classList.add('high-contrast-mode');
-    }
-    
-    const savedSpeakDetections = localStorage.getItem('speakDetections') !== 'false';
-    setSpeakDetections(savedSpeakDetections);
-    
-    const savedUseReadAloud = localStorage.getItem('useReadAloud') !== 'false';
-    setUseReadAloud(savedUseReadAloud);
-    
-    const savedCameraFacing = localStorage.getItem('cameraFacing') || 'environment';
-    setCameraFacing(savedCameraFacing);
-  }, []);
+  const { settings, updateSettings, resetSettings } = useVisionSettings();
+
+  const {
+    fontSize,
+    highContrast,
+    speakDetections,
+    useReadAloud,
+    cameraFacing,
+    detectionMode,
+    speechRate,
+    confidenceFloor,
+  } = settings;
   
   const handleFontSizeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newSize = parseInt(e.target.value);
-    setFontSize(newSize);
-    document.documentElement.style.fontSize = `${newSize}px`;
-    localStorage.setItem('fontSize', newSize.toString());
+    updateSettings({ fontSize: newSize });
   };
   
   const handleHighContrastChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const isChecked = e.target.checked;
-    setHighContrast(isChecked);
-    
-    if (isChecked) {
-      document.body.classList.add('high-contrast-mode');
-    } else {
-      document.body.classList.remove('high-contrast-mode');
-    }
-    
-    localStorage.setItem('highContrast', isChecked.toString());
+    updateSettings({ highContrast: e.target.checked });
   };
   
   const handleSpeakDetectionsChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const isChecked = e.target.checked;
-    setSpeakDetections(isChecked);
-    localStorage.setItem('speakDetections', isChecked.toString());
+    updateSettings({ speakDetections: e.target.checked });
   };
   
   const handleUseReadAloudChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const isChecked = e.target.checked;
-    setUseReadAloud(isChecked);
-    localStorage.setItem('useReadAloud', isChecked.toString());
+    updateSettings({ useReadAloud: isChecked });
     
     // Demonstrate reading aloud
     if (isChecked && 'speechSynthesis' in window) {
@@ -71,19 +44,40 @@ const Settings: React.FC = () => {
   };
   
   const handleCameraFacingChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const value = e.target.value;
-    setCameraFacing(value);
-    localStorage.setItem('cameraFacing', value);
+    const value = e.target.value === 'user' ? 'user' : 'environment';
+    updateSettings({ cameraFacing: value });
+  };
+
+  const handleDetectionModeChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const mode = e.target.value === 'social' || e.target.value === 'quiet' ? e.target.value : 'navigation';
+    updateSettings({ detectionMode: mode });
+  };
+
+  const handleSpeechRateChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    updateSettings({ speechRate: parseFloat(e.target.value) });
+  };
+
+  const handleConfidenceFloorChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    updateSettings({ confidenceFloor: parseInt(e.target.value) });
   };
   
   // Demonstrate read aloud feature
   const readPageAloud = () => {
+    if (!useReadAloud) {
+      toast({
+        title: "Read Aloud Disabled",
+        description: "Enable read aloud in settings to use this action.",
+      });
+      return;
+    }
+
     if ('speechSynthesis' in window) {
       // Get all text content from the page
       const mainContent = document.getElementById('main-content');
       if (mainContent) {
         const textToRead = mainContent.innerText;
         const utterance = new SpeechSynthesisUtterance(textToRead);
+        utterance.rate = speechRate;
         window.speechSynthesis.speak(utterance);
         
         toast({
@@ -100,23 +94,9 @@ const Settings: React.FC = () => {
     }
   };
   
-  const resetSettings = () => {
-    // Reset to defaults
-    setFontSize(16);
-    setHighContrast(false);
-    setSpeakDetections(true);
-    setUseReadAloud(true);
-    setCameraFacing('environment');
-    
-    document.documentElement.style.fontSize = '16px';
-    document.body.classList.remove('high-contrast-mode');
-    
-    localStorage.removeItem('fontSize');
-    localStorage.removeItem('highContrast');
-    localStorage.removeItem('speakDetections');
-    localStorage.removeItem('useReadAloud');
-    localStorage.removeItem('cameraFacing');
-    
+  const handleResetSettings = () => {
+    resetSettings();
+
     toast({
       title: "Settings Reset",
       description: "All settings have been reset to default values",
@@ -227,6 +207,63 @@ const Settings: React.FC = () => {
             </p>
           </div>
         </section>
+
+        <section className="glass-card p-6 animate-fade-in" style={{ animationDelay: '0.15s' }}>
+          <h2 className="text-xl font-semibold mb-4">Detection Profile</h2>
+
+          <div className="space-y-4">
+            <div>
+              <label htmlFor="detection-mode" className="block mb-2 font-medium">
+                Detection Mode
+              </label>
+              <select
+                id="detection-mode"
+                value={detectionMode}
+                onChange={handleDetectionModeChange}
+                className="bg-white border border-gray-300 text-gray-900 rounded-lg focus:ring-babyBlue focus:border-babyBlue block w-full p-2.5"
+              >
+                <option value="navigation">Navigation Assist</option>
+                <option value="social">Social Awareness</option>
+                <option value="quiet">Quiet Guidance</option>
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="speech-rate" className="block mb-2 font-medium">
+                Speech Rate: {speechRate.toFixed(1)}x
+              </label>
+              <input
+                id="speech-rate"
+                type="range"
+                min="0.7"
+                max="1.4"
+                step="0.1"
+                value={speechRate}
+                onChange={handleSpeechRateChange}
+                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="confidence-floor" className="block mb-2 font-medium">
+                Recognition Confidence Floor: {confidenceFloor}%
+              </label>
+              <input
+                id="confidence-floor"
+                type="range"
+                min="35"
+                max="90"
+                step="1"
+                value={confidenceFloor}
+                onChange={handleConfidenceFloorChange}
+                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+              />
+              <p className="mt-2 text-sm text-muted-foreground">
+                Lower values announce more uncertain detections.
+              </p>
+            </div>
+          </div>
+        </section>
         
         <section className="glass-card p-6 animate-fade-in" style={{ animationDelay: '0.2s' }}>
           <h2 className="text-xl font-semibold mb-4">About Vision Mate</h2>
@@ -240,7 +277,7 @@ const Settings: React.FC = () => {
         
         <div className="flex justify-center pt-4 pb-16 animate-fade-in" style={{ animationDelay: '0.3s' }}>
           <button
-            onClick={resetSettings}
+            onClick={handleResetSettings}
             className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-medium py-2 px-4 rounded-full transition-colors"
             aria-label="Reset all settings to default values"
           >

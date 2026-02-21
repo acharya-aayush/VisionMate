@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, Camera, UserPlus, Users, Volume2 } from 'lucide-react';
+import { useVisionSettings } from '@/hooks/useVisionSettings';
 import {
     checkAPIHealth,
     listUsers,
@@ -12,6 +13,7 @@ import {
 
 const FaceRecognition: React.FC = () => {
     const { toast } = useToast();
+    const { settings } = useVisionSettings();
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -35,6 +37,7 @@ const FaceRecognition: React.FC = () => {
 
     // Speak function using Web Speech API
     const speak = useCallback((text: string) => {
+        if (!settings.speakDetections || settings.detectionMode === 'quiet') return;
         if (!('speechSynthesis' in window)) return;
 
         // Don't repeat the same announcement within 5 seconds
@@ -58,14 +61,14 @@ const FaceRecognition: React.FC = () => {
         }
 
         utterance.pitch = 1.1;
-        utterance.rate = 1.0;
+        utterance.rate = settings.speechRate;
 
         window.speechSynthesis.speak(utterance);
         setLastAnnounced(text);
 
         // Clear announcement after 5 seconds
         setTimeout(() => setLastAnnounced(''), 5000);
-    }, [lastAnnounced]);
+    }, [lastAnnounced, settings.detectionMode, settings.speakDetections, settings.speechRate]);
 
     // Check API health on mount
     useEffect(() => {
@@ -133,13 +136,21 @@ const FaceRecognition: React.FC = () => {
     // Handle face recognition results
     useEffect(() => {
         if (recognizedFaces.length > 0) {
-            const knownFaces = recognizedFaces.filter(f => f.is_known);
+            const knownFaces = recognizedFaces.filter(
+                f => f.is_known && f.confidence >= settings.confidenceFloor
+            );
+
             if (knownFaces.length > 0) {
                 const names = knownFaces.map(f => f.user_name).join(' and ');
                 speak(`I see ${names}`);
+            } else if (settings.detectionMode === 'social') {
+                const unknownCount = recognizedFaces.filter(f => !f.is_known).length;
+                if (unknownCount > 0) {
+                    speak(`${unknownCount} unfamiliar face nearby`);
+                }
             }
         }
-    }, [recognizedFaces, speak]);
+    }, [recognizedFaces, settings.confidenceFloor, settings.detectionMode, speak]);
 
     // Start camera
     const startCamera = async () => {
@@ -158,6 +169,7 @@ const FaceRecognition: React.FC = () => {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: {
                     deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+                    facingMode: selectedDeviceId ? undefined : settings.cameraFacing,
                     width: 640,
                     height: 480
                 }

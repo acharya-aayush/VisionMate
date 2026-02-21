@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
 import { Loader2 } from 'lucide-react';
+import { useVisionSettings } from '@/hooks/useVisionSettings';
 
 // Import our library scripts
 declare global {
@@ -13,6 +14,7 @@ declare global {
 
 const CameraView: React.FC = () => {
   const { toast } = useToast();
+  const { settings } = useVisionSettings();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraActive, setCameraActive] = useState(false);
@@ -22,6 +24,7 @@ const CameraView: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const isQuietMode = settings.detectionMode === 'quiet';
   
   // Check if TensorFlow model globals are ready (loaded from index.html)
   useEffect(() => {
@@ -54,6 +57,7 @@ const CameraView: React.FC = () => {
   
   // Function to convert text to speech
   const speak = (text: string) => {
+    if (!settings.speakDetections || isQuietMode) return;
     if (!('speechSynthesis' in window)) return;
     
     const utterance = new SpeechSynthesisUtterance(text);
@@ -70,7 +74,7 @@ const CameraView: React.FC = () => {
         utterance.voice = femaleVoice;
       }
       utterance.pitch = 1.5;
-      utterance.rate = 1.0;
+      utterance.rate = settings.speechRate;
       window.speechSynthesis.speak(utterance);
     }, 100);
   };
@@ -145,7 +149,7 @@ const CameraView: React.FC = () => {
       setIsLoading(true);
       // Start webcam
       const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: 'environment' }
+        video: { facingMode: settings.cameraFacing }
       });
       
       video.srcObject = stream;
@@ -186,7 +190,7 @@ const CameraView: React.FC = () => {
       let lastHandPosition: { x: number, y: number } | null = null;
       const PIXELS_PER_CM = 37.7952755906;
       let lastSpeakTime = 0;
-      const SPEAK_INTERVAL = 5000;
+      const SPEAK_INTERVAL = settings.detectionMode === 'social' ? 7000 : 4000;
       
       // Unified detection loop that handles both hand and object detection
       const runDetection = async () => {

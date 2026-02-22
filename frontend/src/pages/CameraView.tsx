@@ -3,6 +3,7 @@ import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
 import { Loader2 } from 'lucide-react';
 import { useVisionSettings } from '@/hooks/useVisionSettings';
+import { SimpleSortTracker } from '@/lib/simpleSort';
 
 // Import our library scripts
 declare global {
@@ -17,6 +18,7 @@ const CameraView: React.FC = () => {
   const { settings } = useVisionSettings();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const trackerRef = useRef(new SimpleSortTracker({ iouThreshold: 0.28, maxMisses: 6, minHits: 1 }));
   const [cameraActive, setCameraActive] = useState(false);
   const [permissionState, setPermissionState] = useState<string>('prompt');
   const [detectionStatus, setDetectionStatus] = useState<string>('No hand detected');
@@ -147,6 +149,8 @@ const CameraView: React.FC = () => {
 
     try {
       setIsLoading(true);
+      trackerRef.current.reset();
+
       // Start webcam
       const stream = await navigator.mediaDevices.getUserMedia({ 
         video: { facingMode: settings.cameraFacing }
@@ -260,29 +264,45 @@ const CameraView: React.FC = () => {
           
           // Object detection - FIX: No more mirroring
           const objectPredictions = await cocoSsdModel.detect(video);
-          console.log("Object predictions:", objectPredictions);
-          
-          // Focus on cup detection
-          const cupPrediction = objectPredictions.find(p => p.class === 'cup');
-          
-          if (cupPrediction && handCenter) {
-            const [x, y, width, height] = cupPrediction.bbox;
-            
+          const trackedObjects = trackerRef.current.update(
+            objectPredictions
+              .filter((prediction: any) => prediction.score >= 0.42)
+              .map((prediction: any) => {
+                const [x, y, width, height] = prediction.bbox;
+                return {
+                  bbox: [x, y, x + width, y + height] as [number, number, number, number],
+                  score: prediction.score,
+                  label: prediction.class,
+                };
+              })
+          );
+
+          trackedObjects.forEach((track) => {
+            const [x1, y1, x2, y2] = track.bbox;
+            const width = x2 - x1;
+            const height = y2 - y1;
+
             ctx.strokeStyle = 'blue';
             ctx.lineWidth = 2;
-            ctx.strokeRect(x, y, width, height);
-            
+            ctx.strokeRect(x1, y1, width, height);
+
             ctx.fillStyle = 'blue';
-            ctx.font = '18px Arial';
+            ctx.font = '16px Arial';
             ctx.fillText(
-              `${cupPrediction.class} (${Math.round(cupPrediction.score * 100)}%)`,
-              x,
-              y > 10 ? y - 5 : 10
+              `#${track.trackId} ${track.label} (${Math.round(track.score * 100)}%)`,
+              x1,
+              y1 > 12 ? y1 - 5 : 12
             );
-            
+          });
+
+          const primaryTrack = trackedObjects.find((track) => track.label === 'cup') || trackedObjects[0];
+
+          if (primaryTrack && handCenter) {
+            const [x1, y1, x2, y2] = primaryTrack.bbox;
+
             // Calculate the center of the object - FIX: No more mirroring
-            const objectCenterX = x + width / 2;
-            const objectCenterY = y + height / 2;
+            const objectCenterX = x1 + (x2 - x1) / 2;
+            const objectCenterY = y1 + (y2 - y1) / 2;
             
             // Calculate the distance between the hand center and the object center
             const distancePx = Math.sqrt(
@@ -321,20 +341,18 @@ const CameraView: React.FC = () => {
             }
             
             // Display the relative position information
-            setCupInfo(`Cup is ${relativePosition.trim()} of the hand. Distance: ${distanceCm.toFixed(2)} cm`);
+            setCupInfo(`${primaryTrack.label} is ${relativePosition.trim()} of the hand. Distance: ${distanceCm.toFixed(2)} cm`);
             
             // Use text-to-speech to announce the position if the interval has passed
             const currentTime = Date.now();
             if (currentTime - lastSpeakTime > SPEAK_INTERVAL) {
-              speak(`Cup is ${relativePosition.trim()} of the hand`);
+              speak(`${primaryTrack.label} is ${relativePosition.trim()} of the hand`);
               lastSpeakTime = currentTime;
             }
             
-            console.log(`Distance between hand and cup: ${distanceCm.toFixed(2)} cm, Position: ${relativePosition.trim()}`);
-          } else if (objectPredictions.length > 0) {
-            // If no cup but other objects are detected
-            const topPrediction = objectPredictions[0];
-            setCupInfo(`${topPrediction.class} detected (${Math.round(topPrediction.score * 100)}% confidence)`);
+            console.log(`Distance between hand and ${primaryTrack.label}: ${distanceCm.toFixed(2)} cm, Position: ${relativePosition.trim()}`);
+          } else if (primaryTrack) {
+            setCupInfo(`${primaryTrack.label} detected as track #${primaryTrack.trackId} (${Math.round(primaryTrack.score * 100)}% confidence)`);
           } else {
             setCupInfo('');
           }

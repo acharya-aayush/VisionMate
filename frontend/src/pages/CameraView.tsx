@@ -4,6 +4,7 @@ import { useToast } from "@/hooks/use-toast";
 import { Loader2 } from 'lucide-react';
 import { useVisionSettings } from '@/hooks/useVisionSettings';
 import { SimpleSortTracker } from '@/lib/simpleSort';
+import { hybridObjectService } from '@/services/hybridObjectService';
 
 // Import our library scripts
 declare global {
@@ -194,6 +195,8 @@ const CameraView: React.FC = () => {
       let lastHandPosition: { x: number, y: number } | null = null;
       const PIXELS_PER_CM = 37.7952755906;
       let lastSpeakTime = 0;
+      let frameCount = 0;
+      let lastHybridScore: number | null = null;
       const SPEAK_INTERVAL = settings.detectionMode === 'social' ? 7000 : 4000;
       
       // Unified detection loop that handles both hand and object detection
@@ -297,6 +300,18 @@ const CameraView: React.FC = () => {
 
           const primaryTrack = trackedObjects.find((track) => track.label === 'cup') || trackedObjects[0];
 
+          frameCount += 1;
+
+          if (primaryTrack && frameCount % 5 === 0) {
+            lastHybridScore = await hybridObjectService.scoreTrack(video, primaryTrack.bbox);
+          }
+
+          const blendedConfidence = primaryTrack
+            ? Math.round(
+                ((primaryTrack.score * 0.75) + ((lastHybridScore ?? primaryTrack.score) * 0.25)) * 100
+              )
+            : 0;
+
           if (primaryTrack && handCenter) {
             const [x1, y1, x2, y2] = primaryTrack.bbox;
 
@@ -341,7 +356,7 @@ const CameraView: React.FC = () => {
             }
             
             // Display the relative position information
-            setCupInfo(`${primaryTrack.label} is ${relativePosition.trim()} of the hand. Distance: ${distanceCm.toFixed(2)} cm`);
+            setCupInfo(`${primaryTrack.label} is ${relativePosition.trim()} of the hand. Distance: ${distanceCm.toFixed(2)} cm. Hybrid confidence: ${blendedConfidence}%`);
             
             // Use text-to-speech to announce the position if the interval has passed
             const currentTime = Date.now();
@@ -352,7 +367,7 @@ const CameraView: React.FC = () => {
             
             console.log(`Distance between hand and ${primaryTrack.label}: ${distanceCm.toFixed(2)} cm, Position: ${relativePosition.trim()}`);
           } else if (primaryTrack) {
-            setCupInfo(`${primaryTrack.label} detected as track #${primaryTrack.trackId} (${Math.round(primaryTrack.score * 100)}% confidence)`);
+            setCupInfo(`${primaryTrack.label} detected as track #${primaryTrack.trackId} (Hybrid confidence: ${blendedConfidence}%)`);
           } else {
             setCupInfo('');
           }

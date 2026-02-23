@@ -13,7 +13,7 @@ OpenCV is fast, easy, and works everywhere. LBPH is robust for small datasets an
 
 How it works:
 - Images are stored in dataset/ as grayscale jpgs per user.
-- LBPH model is trained with train_face.py.
+- LBPH model is trained via /train endpoint (or SimpleFaceRecognizer.train()).
 - API (face_recognition_api.py) loads the model and does recognition on request.
 - Model and label mapping saved as trainer.yml and user_mapping.json.
 
@@ -22,7 +22,10 @@ Endpoints:
 
 To train:
 - Put images in dataset/userX/
-- Run train_face.py
+- Call POST /train
 - Start API with run_server.bat
+
+To benchmark:
+- Run python benchmark_navigation.py --runs 30
 
 Backend is called by the frontend for face recognition. No UI here, just API and model logic.

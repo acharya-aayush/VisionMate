@@ -8,6 +8,16 @@ export default defineConfig(({ mode }) => ({
     host: "::",
     port: 8080,
   },
+  build: {
+    target: "es2020",
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          onnx: ["onnxruntime-web"],
+        },
+      },
+    },
+  },
   plugins: [
     react(),
   ].filter(Boolean),

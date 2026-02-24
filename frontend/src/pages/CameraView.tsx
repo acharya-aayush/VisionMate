@@ -1,10 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Layout from '../components/Layout';
 import { useToast } from "@/hooks/use-toast";
 import { Loader2 } from 'lucide-react';
 import { useVisionSettings } from '@/hooks/useVisionSettings';
 import { SimpleSortTracker } from '@/lib/simpleSort';
-import { hybridObjectService } from '@/services/hybridObjectService';
 
 // Import our library scripts
 declare global {
@@ -20,6 +19,9 @@ const CameraView: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const trackerRef = useRef(new SimpleSortTracker({ iouThreshold: 0.28, maxMisses: 6, minHits: 1 }));
+  const hybridServiceRef = useRef<null | {
+    scoreTrack: (video: HTMLVideoElement, bbox: [number, number, number, number]) => Promise<number | null>;
+  }>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [permissionState, setPermissionState] = useState<string>('prompt');
   const [detectionStatus, setDetectionStatus] = useState<string>('No hand detected');
@@ -28,6 +30,21 @@ const CameraView: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const isQuietMode = settings.detectionMode === 'quiet';
+
+  const loadHybridService = useCallback(async () => {
+    if (hybridServiceRef.current) {
+      return hybridServiceRef.current;
+    }
+
+    try {
+      const module = await import('@/services/hybridObjectService');
+      hybridServiceRef.current = module.hybridObjectService;
+      return hybridServiceRef.current;
+    } catch (error) {
+      console.warn('Hybrid ONNX stage unavailable', error);
+      return null;
+    }
+  }, []);
   
   // Check if TensorFlow model globals are ready (loaded from index.html)
   useEffect(() => {
@@ -302,8 +319,11 @@ const CameraView: React.FC = () => {
 
           frameCount += 1;
 
-          if (primaryTrack && frameCount % 5 === 0) {
-            lastHybridScore = await hybridObjectService.scoreTrack(video, primaryTrack.bbox);
+          if (primaryTrack && frameCount % 5 === 0 && settings.detectionMode !== 'quiet') {
+            const hybridService = await loadHybridService();
+            if (hybridService) {
+              lastHybridScore = await hybridService.scoreTrack(video, primaryTrack.bbox);
+            }
           }
 
           const blendedConfidence = primaryTrack

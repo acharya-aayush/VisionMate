@@ -6,6 +6,7 @@ Clean implementation - no external dependencies beyond opencv-contrib-python
 
 import os
 import json
+import shutil
 import cv2
 import numpy as np
 from pathlib import Path
@@ -233,6 +234,29 @@ class SimpleFaceRecognizer:
     
     def list_users(self) -> Dict[int, str]:
         return self.user_names.copy()
+
+    def remove_user(self, user_id: int) -> bool:
+        """Remove a registered user, dataset samples, and refresh model state."""
+        if user_id not in self.user_names:
+            return False
+
+        self.user_names.pop(user_id, None)
+        self._save_user_mapping()
+
+        user_folder = self.dataset_path / f"user{user_id}"
+        if user_folder.exists() and user_folder.is_dir():
+            shutil.rmtree(user_folder, ignore_errors=True)
+
+        # If there are no users left, clear model state.
+        if not self.user_names:
+            self.is_trained = False
+            if self.model_path.exists():
+                self.model_path.unlink(missing_ok=True)
+            return True
+
+        # Re-train from remaining user data.
+        self.train()
+        return True
 
 
 if __name__ == "__main__":

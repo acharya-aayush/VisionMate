@@ -23,6 +23,8 @@ build/
 .yarn/
 .pnpm-debug.log
 
+docs/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -33,6 +35,7 @@ Thumbs.db
 # Env files
 .env
 .env.*
+.venv/
 
 # Misc
 *.bak

@@ -1,40 +1,161 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Layout from '../components/Layout';
-import { useToast } from "@/hooks/use-toast";
-import { Loader2 } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
 import { useVisionSettings } from '@/hooks/useVisionSettings';
 import { SimpleSortTracker } from '@/lib/simpleSort';
+import { API_BASE_URL } from '@/config/runtime';
+import { getLatestMobileFrame } from '@/services/faceRecognitionService';
+import {
+  captureVideoFrameBase64,
+  detectObjectsAccurateBase64,
+} from '@/services/objectDetectionService';
+import {
+  CheckIcon,
+  CopyIcon,
+  DeviceCameraVideoIcon,
+  LinkExternalIcon,
+  ShieldLockIcon,
+  StopIcon,
+  SyncIcon,
+} from '@primer/octicons-react';
 
-// Import our library scripts
 declare global {
+  interface HandPosePrediction {
+    landmarks: Array<[number, number, number]>;
+  }
+
+  interface HandPoseModel {
+    estimateHands: (input: HTMLVideoElement) => Promise<HandPosePrediction[]>;
+  }
+
+  interface CocoSsdPrediction {
+    bbox: [number, number, number, number];
+    score: number;
+    class: string;
+  }
+
+  interface CocoSsdModel {
+    detect: (
+      input: HTMLVideoElement,
+      maxNumBoxes?: number,
+      minScore?: number
+    ) => Promise<CocoSsdPrediction[]>;
+  }
+
   interface Window {
-    handpose: any;
-    cocoSsd: any;
+    handpose: {
+      load: () => Promise<HandPoseModel>;
+    };
+    cocoSsd: {
+      load: (config?: { base?: string }) => Promise<CocoSsdModel>;
+    };
   }
 }
+
+type CameraSourceMode = 'local' | 'mobile';
+
+interface DetectionCandidate {
+  bbox: [number, number, number, number];
+  score: number;
+  label: string;
+}
+
+interface QrCodeModule {
+  toDataURL: (
+    text: string,
+    options?: {
+      width?: number;
+      margin?: number;
+      errorCorrectionLevel?: 'L' | 'M' | 'Q' | 'H';
+    }
+  ) => Promise<string>;
+}
+
+const PIXELS_PER_CM = 37.7952755906;
+
+const buildSessionId = (): string => Math.random().toString(36).slice(2, 8);
+
+const isLoopbackHost = (host: string): boolean =>
+  host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0';
+
+const extractHostFromUrl = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+};
+
+const resolveDefaultMobileHost = (): string => {
+  const browserHost = window.location.hostname || 'localhost';
+  if (!isLoopbackHost(browserHost)) {
+    return browserHost;
+  }
+
+  const apiHost = extractHostFromUrl(API_BASE_URL);
+  if (apiHost && !isLoopbackHost(apiHost)) {
+    return apiHost;
+  }
+
+  return browserHost;
+};
 
 const CameraView: React.FC = () => {
   const { toast } = useToast();
   const { settings } = useVisionSettings();
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const trackerRef = useRef(new SimpleSortTracker({ iouThreshold: 0.28, maxMisses: 6, minHits: 1 }));
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const detectionLoopRef = useRef<number | null>(null);
+  const mobilePollTimerRef = useRef<number | null>(null);
+  const detectionActiveRef = useRef(false);
+  const relayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const relayImageRef = useRef<HTMLImageElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastRelayTimestampRef = useRef<string>('');
+
+  const backendStateRef = useRef<{
+    pending: boolean;
+    lastAt: number;
+    objects: DetectionCandidate[];
+    latencyMs: number;
+  }>({
+    pending: false,
+    lastAt: 0,
+    objects: [],
+    latencyMs: 0,
+  });
+
+  const trackerRef = useRef(
+    new SimpleSortTracker({ iouThreshold: 0.3, maxMisses: 8, minHits: 2, smoothing: 0.38 })
+  );
   const hybridServiceRef = useRef<null | {
     scoreTrack: (video: HTMLVideoElement, bbox: [number, number, number, number]) => Promise<number | null>;
   }>(null);
+  const handModelRef = useRef<HandPoseModel | null>(null);
+  const objectModelRef = useRef<CocoSsdModel | null>(null);
+
+  const [sourceMode, setSourceMode] = useState<CameraSourceMode>('local');
   const [cameraActive, setCameraActive] = useState(false);
-  const [permissionState, setPermissionState] = useState<string>('prompt');
-  const [detectionStatus, setDetectionStatus] = useState<string>('No hand detected');
-  const [cupInfo, setCupInfo] = useState<string>('');
+  const [detectionStatus, setDetectionStatus] = useState('Camera is idle');
+  const [objectInfo, setObjectInfo] = useState('');
+  const [permissionState, setPermissionState] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [isLoading, setIsLoading] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [mobileSessionId, setMobileSessionId] = useState(buildSessionId);
+  const [mobileHost, setMobileHost] = useState(resolveDefaultMobileHost);
+  const [mobileFrameTime, setMobileFrameTime] = useState<string>('');
+  const [copied, setCopied] = useState(false);
+  const [backendLatencyMs, setBackendLatencyMs] = useState<number | null>(null);
+  const [backendError, setBackendError] = useState('');
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState('');
+
   const isQuietMode = settings.detectionMode === 'quiet';
+  const objectScoreFloor = settings.objectConfidenceFloor / 100;
 
   const loadHybridService = useCallback(async () => {
-    if (hybridServiceRef.current) {
-      return hybridServiceRef.current;
-    }
+    if (hybridServiceRef.current) return hybridServiceRef.current;
 
     try {
       const module = await import('@/services/hybridObjectService');
@@ -45,441 +166,849 @@ const CameraView: React.FC = () => {
       return null;
     }
   }, []);
-  
-  // Check if TensorFlow model globals are ready (loaded from index.html)
+
+  const mobileCaptureUrl = useMemo(() => {
+    const cleanHostInput = mobileHost.trim().replace(/^https?:\/\//i, '').replace(/\/$/, '');
+    const cleanHost = cleanHostInput || window.location.hostname || 'localhost';
+    const hostWithPort = cleanHost.includes(':')
+      ? cleanHost
+      : `${cleanHost}${window.location.port ? `:${window.location.port}` : ''}`;
+
+    const appBase = `${window.location.protocol}//${hostWithPort}`;
+    const apiBaseForPhone = API_BASE_URL
+      .replace('localhost', cleanHost || window.location.hostname)
+      .replace('127.0.0.1', cleanHost || window.location.hostname);
+
+    return `${appBase}/mobile-camera?session=${encodeURIComponent(mobileSessionId)}&api=${encodeURIComponent(apiBaseForPhone)}`;
+  }, [mobileHost, mobileSessionId]);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!isLoopbackHost(mobileHost.trim())) {
+      return () => {
+        active = false;
+      };
+    }
+
+    const resolveLanHost = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/network-info`);
+        if (!response.ok) {
+          return;
+        }
+
+        const payload = (await response.json()) as { lan_ips?: string[] };
+        const lanIp = (payload.lan_ips || []).find(
+          (ip) => typeof ip === 'string' && ip.length > 0 && !isLoopbackHost(ip)
+        );
+
+        if (!active || !lanIp) {
+          return;
+        }
+
+        setMobileHost((prev) => {
+          const trimmed = prev.trim();
+          return isLoopbackHost(trimmed) || trimmed === '' ? lanIp : prev;
+        });
+      } catch (error) {
+        console.warn('LAN host auto-detect failed:', error);
+      }
+    };
+
+    void resolveLanHost();
+
+    return () => {
+      active = false;
+    };
+  }, [mobileHost]);
+
+  const clearDetectionLoop = useCallback(() => {
+    detectionActiveRef.current = false;
+
+    if (detectionLoopRef.current !== null) {
+      window.cancelAnimationFrame(detectionLoopRef.current);
+      detectionLoopRef.current = null;
+    }
+
+    if (mobilePollTimerRef.current !== null) {
+      window.clearTimeout(mobilePollTimerRef.current);
+      mobilePollTimerRef.current = null;
+    }
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    clearDetectionLoop();
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+
+    if (videoRef.current?.srcObject) {
+      const activeStream = videoRef.current.srcObject as MediaStream;
+      activeStream.getTracks().forEach((track) => track.stop());
+      videoRef.current.srcObject = null;
+    }
+
+    trackerRef.current.reset();
+    setCameraActive(false);
+    setMobileFrameTime('');
+    setObjectInfo('');
+    setDetectionStatus('Camera is idle');
+    setBackendError('');
+    setBackendLatencyMs(null);
+    backendStateRef.current = {
+      pending: false,
+      lastAt: 0,
+      objects: [],
+      latencyMs: 0,
+    };
+    window.speechSynthesis?.cancel();
+  }, [clearDetectionLoop]);
+
+  const revokeCameraAccess = useCallback(() => {
+    stopCamera();
+    setPermissionState('prompt');
+
+    toast({
+      title: 'Camera turned off',
+      description:
+        'Browsers block direct permission revocation. Open browser site settings if you want full camera revocation.',
+    });
+  }, [stopCamera, toast]);
+
+  const speak = useCallback(
+    (text: string) => {
+      if (!settings.speakDetections || isQuietMode) return;
+      if (!('speechSynthesis' in window)) return;
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = settings.speechRate;
+      utterance.pitch = 1.06;
+      window.speechSynthesis.speak(utterance);
+    },
+    [isQuietMode, settings.speakDetections, settings.speechRate]
+  );
+
+  const waitForVideoReady = useCallback(async () => {
+    if (!videoRef.current) return;
+
+    const video = videoRef.current;
+    if (video.readyState >= 2) return;
+
+    await new Promise<void>((resolve) => {
+      const onReady = () => {
+        video.removeEventListener('loadeddata', onReady);
+        resolve();
+      };
+
+      video.addEventListener('loadeddata', onReady);
+    });
+  }, []);
+
+  const ensureModels = useCallback(async (needBrowserDetector: boolean) => {
+    if (!window.handpose || !window.cocoSsd) {
+      throw new Error('Vision model scripts not loaded in browser runtime');
+    }
+
+    if (!handModelRef.current) {
+      handModelRef.current = await window.handpose.load();
+    }
+
+    if (needBrowserDetector && !objectModelRef.current) {
+      objectModelRef.current = await window.cocoSsd.load({ base: 'mobilenet_v2' });
+    }
+  }, []);
+
+  const requestBackendObjects = useCallback(async (video: HTMLVideoElement) => {
+    const state = backendStateRef.current;
+    const now = performance.now();
+
+    if (state.pending || now - state.lastAt < 220) {
+      return;
+    }
+
+    if (!captureCanvasRef.current) {
+      captureCanvasRef.current = document.createElement('canvas');
+    }
+
+    const image = captureVideoFrameBase64(video, captureCanvasRef.current);
+    if (!image) {
+      return;
+    }
+
+    state.pending = true;
+    state.lastAt = now;
+
+    try {
+      const response = await detectObjectsAccurateBase64(image, objectScoreFloor, 14);
+      const parsedObjects: DetectionCandidate[] = [];
+
+      for (const object of response.objects) {
+        if (!Array.isArray(object.bbox) || object.bbox.length !== 4) {
+          continue;
+        }
+
+        const x1 = Number(object.bbox[0]);
+        const y1 = Number(object.bbox[1]);
+        const x2 = Number(object.bbox[2]);
+        const y2 = Number(object.bbox[3]);
+
+        if (![x1, y1, x2, y2].every((value) => Number.isFinite(value))) {
+          continue;
+        }
+
+        parsedObjects.push({
+          label: object.label,
+          score: Number(object.score),
+          bbox: [x1, y1, x2, y2],
+        });
+      }
+
+      state.objects = parsedObjects;
+      state.latencyMs = response.latency_ms;
+      setBackendLatencyMs(Math.round(response.latency_ms));
+      setBackendError('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Accurate mode temporarily unavailable';
+      setBackendError(message);
+    } finally {
+      state.pending = false;
+    }
+  }, [objectScoreFloor]);
+
+  const startDetectionLoop = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    const usingAccurateBackend = settings.detectionEngine === 'accurate-yolo';
+    await ensureModels(!usingAccurateBackend);
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    detectionActiveRef.current = true;
+    trackerRef.current.reset();
+
+    let lastSpeakAt = 0;
+    let frameCount = 0;
+    let lastHybridScore: number | null = null;
+    const speakInterval = settings.detectionMode === 'social' ? 6500 : 3800;
+
+    const detectFrame = async () => {
+      if (!detectionActiveRef.current) return;
+
+      if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+        detectionLoopRef.current = window.requestAnimationFrame(() => {
+          void detectFrame();
+        });
+        return;
+      }
+
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      try {
+        const handPredictions = await handModelRef.current?.estimateHands(video);
+        const hand = handPredictions?.[0];
+
+        let handCenter: { x: number; y: number } | null = null;
+
+        if (hand?.landmarks?.length) {
+          const landmarks = hand.landmarks;
+          const cx = landmarks.reduce((sum, point) => sum + point[0], 0) / landmarks.length;
+          const cy = landmarks.reduce((sum, point) => sum + point[1], 0) / landmarks.length;
+          handCenter = { x: cx, y: cy };
+
+          ctx.fillStyle = '#f97316';
+          for (const [x, y] of landmarks) {
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        let detectionCandidates: DetectionCandidate[] = [];
+
+        if (usingAccurateBackend) {
+          await requestBackendObjects(video);
+          detectionCandidates = backendStateRef.current.objects.filter(
+            (candidate) => candidate.score >= objectScoreFloor
+          );
+        } else {
+          const objectPredictions = await objectModelRef.current?.detect(video, 12, objectScoreFloor);
+          detectionCandidates = (objectPredictions || [])
+            .filter((prediction) => prediction.score >= objectScoreFloor)
+            .map((prediction) => {
+              const [x, y, width, height] = prediction.bbox;
+              return {
+                bbox: [x, y, x + width, y + height] as [number, number, number, number],
+                score: prediction.score,
+                label: prediction.class,
+              };
+            });
+        }
+
+        const trackedObjects = trackerRef.current.update(detectionCandidates);
+
+        for (const track of trackedObjects) {
+          const [x1, y1, x2, y2] = track.bbox;
+          const width = x2 - x1;
+          const height = y2 - y1;
+
+          ctx.strokeStyle = '#0ea5e9';
+          ctx.lineWidth = 2.5;
+          ctx.strokeRect(x1, y1, width, height);
+
+          ctx.fillStyle = '#082f49';
+          ctx.fillRect(x1, Math.max(0, y1 - 20), 220, 20);
+          ctx.fillStyle = '#f8fafc';
+          ctx.font = '13px ui-sans-serif, system-ui, sans-serif';
+          ctx.fillText(`#${track.trackId} ${track.label} ${Math.round(track.score * 100)}%`, x1 + 6, y1 > 18 ? y1 - 6 : 14);
+        }
+
+        const primaryTrack = trackedObjects.find((track) => track.label === 'cup') || trackedObjects[0];
+        frameCount += 1;
+
+        if (primaryTrack && frameCount % 4 === 0 && settings.detectionMode !== 'quiet') {
+          const hybridService = await loadHybridService();
+          if (hybridService) {
+            lastHybridScore = await hybridService.scoreTrack(video, primaryTrack.bbox);
+          }
+        }
+
+        if (!primaryTrack) {
+          setDetectionStatus(
+            handCenter
+              ? 'Hand tracked, but no high-confidence object found'
+              : 'No stable object detected yet'
+          );
+          setObjectInfo('');
+        } else {
+          const blendedConfidence = Math.round(
+            ((primaryTrack.score * 0.75) + ((lastHybridScore ?? primaryTrack.score) * 0.25)) * 100
+          );
+
+          if (handCenter) {
+            const [x1, y1, x2, y2] = primaryTrack.bbox;
+            const objectCenterX = x1 + (x2 - x1) / 2;
+            const objectCenterY = y1 + (y2 - y1) / 2;
+
+            const distancePx = Math.hypot(objectCenterX - handCenter.x, objectCenterY - handCenter.y);
+            const distanceCm = distancePx / PIXELS_PER_CM;
+
+            ctx.strokeStyle = '#facc15';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(handCenter.x, handCenter.y);
+            ctx.lineTo(objectCenterX, objectCenterY);
+            ctx.stroke();
+
+            const leftRight = objectCenterX < handCenter.x ? 'left' : 'right';
+            const upDown = objectCenterY < handCenter.y ? 'up' : 'down';
+            const descriptor = `${leftRight} ${upDown}`;
+
+            setDetectionStatus(
+              `${trackedObjects.length} tracked object(s) on ${usingAccurateBackend ? 'accurate YOLO mode' : 'fast browser mode'}`
+            );
+            setObjectInfo(
+              `${primaryTrack.label} is ${descriptor} of hand · ${distanceCm.toFixed(1)} cm · confidence ${blendedConfidence}%`
+            );
+
+            if (Date.now() - lastSpeakAt > speakInterval) {
+              speak(`${primaryTrack.label} ${descriptor}`);
+              lastSpeakAt = Date.now();
+            }
+          } else {
+            setDetectionStatus(
+              `${trackedObjects.length} tracked object(s) on ${usingAccurateBackend ? 'accurate YOLO mode' : 'fast browser mode'}`
+            );
+            setObjectInfo(
+              `Top object: ${primaryTrack.label} · track #${primaryTrack.trackId} · confidence ${blendedConfidence}%`
+            );
+
+            if (Date.now() - lastSpeakAt > speakInterval) {
+              speak(`${primaryTrack.label} detected`);
+              lastSpeakAt = Date.now();
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Detection error:', error);
+        setDetectionStatus('Detection temporarily unavailable');
+      }
+
+      detectionLoopRef.current = window.requestAnimationFrame(() => {
+        void detectFrame();
+      });
+    };
+
+    await detectFrame();
+  }, [ensureModels, loadHybridService, objectScoreFloor, requestBackendObjects, settings.detectionEngine, settings.detectionMode, speak]);
+
+  const startLocalCamera = useCallback(async () => {
+    if (!videoRef.current) return;
+
+    setIsLoading(true);
+
+    try {
+      stopCamera();
+
+      if (navigator.permissions?.query) {
+        try {
+          const status = await navigator.permissions.query({ name: 'camera' as PermissionName });
+          setPermissionState(status.state as 'prompt' | 'granted' | 'denied');
+        } catch {
+          setPermissionState('prompt');
+        }
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: settings.cameraFacing,
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+
+      localStreamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+      await waitForVideoReady();
+
+      setPermissionState('granted');
+      setCameraActive(true);
+      setDetectionStatus(
+        `Local camera connected · ${settings.detectionEngine === 'accurate-yolo' ? 'Accurate YOLO mode' : 'Fast browser mode'}`
+      );
+      toast({
+        title: 'Camera connected',
+        description:
+          settings.detectionEngine === 'accurate-yolo'
+            ? 'Using backend YOLO ONNX for high-accuracy detection.'
+            : 'Using fast browser detector for low latency.',
+      });
+
+      await startDetectionLoop();
+    } catch (error) {
+      console.error('Local camera start failed:', error);
+      setDetectionStatus('Unable to start camera');
+      setPermissionState('denied');
+      toast({
+        title: 'Camera access blocked',
+        description: 'Please allow camera permission and retry.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [settings.cameraFacing, settings.detectionEngine, startDetectionLoop, stopCamera, toast, waitForVideoReady]);
+
+  const beginRelayPolling = useCallback(() => {
+    const ensureRelayObjects = () => {
+      if (!relayCanvasRef.current) {
+        relayCanvasRef.current = document.createElement('canvas');
+        relayCanvasRef.current.width = 960;
+        relayCanvasRef.current.height = 540;
+      }
+
+      if (!relayImageRef.current) {
+        relayImageRef.current = new Image();
+      }
+    };
+
+    ensureRelayObjects();
+
+    const poll = async () => {
+      if (!detectionActiveRef.current || sourceMode !== 'mobile') return;
+
+      try {
+        const frame = await getLatestMobileFrame(mobileSessionId);
+        if (frame.has_frame && frame.image && frame.updated_at !== lastRelayTimestampRef.current) {
+          lastRelayTimestampRef.current = frame.updated_at || '';
+          setMobileFrameTime(frame.updated_at || '');
+
+          const relayCanvas = relayCanvasRef.current;
+          const relayImage = relayImageRef.current;
+          if (relayCanvas && relayImage) {
+            relayImage.onload = () => {
+              const ctx = relayCanvas.getContext('2d');
+              if (!ctx) return;
+
+              if (relayCanvas.width !== relayImage.naturalWidth || relayCanvas.height !== relayImage.naturalHeight) {
+                relayCanvas.width = Math.max(320, relayImage.naturalWidth);
+                relayCanvas.height = Math.max(240, relayImage.naturalHeight);
+              }
+
+              ctx.drawImage(relayImage, 0, 0, relayCanvas.width, relayCanvas.height);
+            };
+            relayImage.src = frame.image;
+          }
+        }
+      } catch (error) {
+        console.warn('Relay polling error:', error);
+      }
+
+      mobilePollTimerRef.current = window.setTimeout(poll, 140);
+    };
+
+    mobilePollTimerRef.current = window.setTimeout(poll, 0);
+  }, [mobileSessionId, sourceMode]);
+
+  const startMobileRelay = useCallback(async () => {
+    if (!videoRef.current) return;
+
+    setIsLoading(true);
+
+    try {
+      stopCamera();
+
+      if (!relayCanvasRef.current) {
+        relayCanvasRef.current = document.createElement('canvas');
+        relayCanvasRef.current.width = 960;
+        relayCanvasRef.current.height = 540;
+      }
+
+      const relayStream = relayCanvasRef.current.captureStream(20);
+      videoRef.current.srcObject = relayStream;
+      await videoRef.current.play();
+      await waitForVideoReady();
+
+      setCameraActive(true);
+      setDetectionStatus(
+        `Waiting for mobile frames · ${settings.detectionEngine === 'accurate-yolo' ? 'Accurate YOLO mode' : 'Fast browser mode'}`
+      );
+      detectionActiveRef.current = true;
+      beginRelayPolling();
+
+      toast({
+        title: 'Mobile relay enabled',
+        description: 'Scan the QR code with your phone and keep that page open.',
+      });
+
+      await startDetectionLoop();
+    } catch (error) {
+      console.error('Mobile relay start failed:', error);
+      setDetectionStatus('Mobile relay failed to initialize');
+      toast({
+        title: 'Relay error',
+        description: 'Could not start the mobile relay stream.',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [beginRelayPolling, settings.detectionEngine, startDetectionLoop, stopCamera, toast, waitForVideoReady]);
+
+  const startSelectedSource = useCallback(async () => {
+    if (!modelsLoaded) {
+      toast({
+        title: 'Models still loading',
+        description: 'Please wait a few seconds and try again.',
+      });
+      return;
+    }
+
+    if (sourceMode === 'local') {
+      await startLocalCamera();
+      return;
+    }
+
+    await startMobileRelay();
+  }, [modelsLoaded, sourceMode, startLocalCamera, startMobileRelay, toast]);
+
+  const copyMobileUrl = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(mobileCaptureUrl);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      toast({ title: 'Copy failed', description: 'Copy the link manually.', variant: 'destructive' });
+    }
+  }, [mobileCaptureUrl, toast]);
+
+  const refreshSessionId = useCallback(() => {
+    setMobileSessionId(buildSessionId());
+  }, []);
+
   useEffect(() => {
     let attempts = 0;
-    const maxAttempts = 30;
+    const maxAttempts = 40;
 
-    const checkLibraries = setInterval(() => {
+    const checkLibraries = window.setInterval(() => {
       attempts += 1;
 
       if (window.handpose && window.cocoSsd) {
-        clearInterval(checkLibraries);
+        window.clearInterval(checkLibraries);
         setModelsLoaded(true);
         return;
       }
 
       if (attempts >= maxAttempts) {
-        clearInterval(checkLibraries);
+        window.clearInterval(checkLibraries);
         toast({
-          title: 'Model Load Timeout',
-          description: 'Could not load vision models. Please refresh and try again.',
+          title: 'Model load timeout',
+          description: 'Vision models did not load. Refresh and retry.',
           variant: 'destructive',
         });
       }
     }, 250);
 
     return () => {
-      clearInterval(checkLibraries);
+      window.clearInterval(checkLibraries);
+      stopCamera();
     };
-  }, [toast]);
-  
-  // Function to convert text to speech
-  const speak = (text: string) => {
-    if (!settings.speakDetections || isQuietMode) return;
-    if (!('speechSynthesis' in window)) return;
-    
-    const utterance = new SpeechSynthesisUtterance(text);
-    // Get the available voices only after the voices have been loaded
-    setTimeout(() => {
-      const voices = window.speechSynthesis.getVoices();
-      const femaleVoice = voices.find(voice => 
-        voice.name.includes('Google UK English Female') || 
-        voice.name.includes('Microsoft Zira') || 
-        (voice as any).gender === 'female'
-      );
-      
-      if (femaleVoice) {
-        utterance.voice = femaleVoice;
-      }
-      utterance.pitch = 1.5;
-      utterance.rate = settings.speechRate;
-      window.speechSynthesis.speak(utterance);
-    }, 100);
-  };
+  }, [stopCamera, toast]);
 
-  const initializeCamera = async () => {
-    try {
-      // Simulate connecting to glasses
-      setIsConnecting(true);
-      toast({
-        title: "Establishing connection with glasses...",
-        description: "Please wait while we connect to your device.",
-      });
-      
-      // Wait for 3 seconds to simulate connection
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      setIsConnecting(false);
-      
-      // Check camera permission state
-      if (navigator.permissions && navigator.permissions.query) {
-        try {
-          const permissionStatus = await navigator.permissions.query({ name: 'camera' as PermissionName });
-          setPermissionState(permissionStatus.state);
-          
-          permissionStatus.onchange = () => {
-            setPermissionState(permissionStatus.state);
-            if (permissionStatus.state === 'granted') {
-              setupDetection();
-            }
-          };
-          
-          if (permissionStatus.state === 'granted') {
-            setupDetection();
-          } else {
-            // If permission is not granted yet, try to request it
-            setupDetection();
-          }
-        } catch (error) {
-          console.error("Error checking camera permissions:", error);
-          setupDetection(); // Try anyway
-        }
-      } else {
-        // Fallback for browsers that don't support permission API
-        setupDetection();
-      }
-    } catch (err) {
-      console.error("Error initializing camera:", err);
-      setIsConnecting(false);
-      toast({
-        title: "Connection Failed",
-        description: "Could not establish connection with glasses. Please try again.",
-        variant: "destructive",
-      });
-    }
-  };
+  useEffect(() => {
+    let active = true;
 
-  const setupDetection = async () => {
-    if (!videoRef.current || !canvasRef.current) {
-      console.error("Video or canvas element not found");
-      return;
+    if (sourceMode !== 'mobile') {
+      setQrCodeDataUrl('');
+      return () => {
+        active = false;
+      };
     }
 
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    
-    if (!ctx) {
-      console.error("Could not get canvas context");
-      return;
-    }
-
-    try {
-      setIsLoading(true);
-      trackerRef.current.reset();
-
-      // Start webcam
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: settings.cameraFacing }
-      });
-      
-      video.srcObject = stream;
-      
-      // Wait for video to be loaded and play it
-      video.onloadedmetadata = () => {
-        video.play().catch(err => {
-          console.error("Error playing video:", err);
-          setIsLoading(false);
-          toast({
-            title: "Video Playback Error",
-            description: "Could not start video playback. Please refresh and try again.",
-            variant: "destructive",
-          });
+    const generateQr = async () => {
+      try {
+        const qrModule = (await import('qrcode')) as QrCodeModule;
+        const url = await qrModule.toDataURL(mobileCaptureUrl, {
+          width: 220,
+          margin: 1,
+          errorCorrectionLevel: 'M',
         });
-      };
-      
-      // Set canvas dimensions to match video after video is playing
-      video.onplaying = () => {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        setCameraActive(true);
-        setIsLoading(false);
-        toast({
-          title: "Connection Established",
-          description: "Hand and object detection initialized",
-        });
-      };
-      
-      // Load both models
-      const handposeModel = await window.handpose.load();
-      const cocoSsdModel = await window.cocoSsd.load();
-      
-      console.log("Handpose and COCO-SSD models loaded");
-      
-      // Variables for tracking
-      let handCenter: { x: number, y: number } | null = null;
-      let lastHandPosition: { x: number, y: number } | null = null;
-      const PIXELS_PER_CM = 37.7952755906;
-      let lastSpeakTime = 0;
-      let frameCount = 0;
-      let lastHybridScore: number | null = null;
-      const SPEAK_INTERVAL = settings.detectionMode === 'social' ? 7000 : 4000;
-      
-      // Unified detection loop that handles both hand and object detection
-      const runDetection = async () => {
-        if (!video.readyState || video.readyState < 2) {
-          requestAnimationFrame(runDetection);
-          return;
+        if (active) {
+          setQrCodeDataUrl(url);
         }
-        
-        // Clear the canvas before drawing
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        try {
-          // Hand detection
-          const handPredictions = await handposeModel.estimateHands(video);
-          console.log("Hand predictions:", handPredictions);
-          
-          if (handPredictions.length > 0) {
-            const landmarks = handPredictions[0].landmarks;
-            
-            // Draw hand landmarks (red circles) - FIX: No more mirroring
-            for (let i = 0; i < landmarks.length; i++) {
-              const [x, y] = landmarks[i];
-              ctx.beginPath();
-              ctx.arc(x, y, 5, 0, 2 * Math.PI);
-              ctx.fillStyle = 'red';
-              ctx.fill();
-            }
-            
-            // Draw lines connecting the landmarks to form a mesh (green lines) - FIX: No more mirroring
-            const connections = [
-              [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
-              [0, 5], [5, 6], [6, 7], [7, 8], // Index finger
-              [5, 9], [9, 10], [10, 11], [11, 12], // Middle finger
-              [9, 13], [13, 14], [14, 15], [15, 16], // Ring finger
-              [13, 17], [17, 18], [18, 19], [19, 20], // Pinky finger
-              [0, 17] // Palm base
-            ];
-            
-            ctx.strokeStyle = 'green';
-            ctx.lineWidth = 2;
-            connections.forEach(([start, end]) => {
-              const [startX, startY] = landmarks[start];
-              const [endX, endY] = landmarks[end];
-              ctx.beginPath();
-              ctx.moveTo(startX, startY);
-              ctx.lineTo(endX, endY);
-              ctx.stroke();
-            });
-            
-            // Calculate the center of the hand - FIX: No more mirroring
-            const centerX = landmarks.reduce((sum, point) => sum + point[0], 0) / landmarks.length;
-            const centerY = landmarks.reduce((sum, point) => sum + point[1], 0) / landmarks.length;
-            handCenter = { x: centerX, y: centerY };
-            
-            if (lastHandPosition) {
-              const distance = Math.sqrt(
-                Math.pow(centerX - lastHandPosition.x, 2) +
-                Math.pow(centerY - lastHandPosition.y, 2)
-              );
-              setDetectionStatus(`Movement detected! Distance: ${distance.toFixed(2)}px`);
-            }
-            lastHandPosition = { x: centerX, y: centerY };
-          } else {
-            setDetectionStatus('No hand detected.');
-            handCenter = null;
-          }
-          
-          // Object detection - FIX: No more mirroring
-          const objectPredictions = await cocoSsdModel.detect(video);
-          const trackedObjects = trackerRef.current.update(
-            objectPredictions
-              .filter((prediction: any) => prediction.score >= 0.42)
-              .map((prediction: any) => {
-                const [x, y, width, height] = prediction.bbox;
-                return {
-                  bbox: [x, y, x + width, y + height] as [number, number, number, number],
-                  score: prediction.score,
-                  label: prediction.class,
-                };
-              })
-          );
+      } catch (error) {
+        console.warn('QR generation failed:', error);
+      }
+    };
 
-          trackedObjects.forEach((track) => {
-            const [x1, y1, x2, y2] = track.bbox;
-            const width = x2 - x1;
-            const height = y2 - y1;
+    void generateQr();
 
-            ctx.strokeStyle = 'blue';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(x1, y1, width, height);
+    return () => {
+      active = false;
+    };
+  }, [mobileCaptureUrl, sourceMode]);
 
-            ctx.fillStyle = 'blue';
-            ctx.font = '16px Arial';
-            ctx.fillText(
-              `#${track.trackId} ${track.label} (${Math.round(track.score * 100)}%)`,
-              x1,
-              y1 > 12 ? y1 - 5 : 12
-            );
-          });
-
-          const primaryTrack = trackedObjects.find((track) => track.label === 'cup') || trackedObjects[0];
-
-          frameCount += 1;
-
-          if (primaryTrack && frameCount % 5 === 0 && settings.detectionMode !== 'quiet') {
-            const hybridService = await loadHybridService();
-            if (hybridService) {
-              lastHybridScore = await hybridService.scoreTrack(video, primaryTrack.bbox);
-            }
-          }
-
-          const blendedConfidence = primaryTrack
-            ? Math.round(
-                ((primaryTrack.score * 0.75) + ((lastHybridScore ?? primaryTrack.score) * 0.25)) * 100
-              )
-            : 0;
-
-          if (primaryTrack && handCenter) {
-            const [x1, y1, x2, y2] = primaryTrack.bbox;
-
-            // Calculate the center of the object - FIX: No more mirroring
-            const objectCenterX = x1 + (x2 - x1) / 2;
-            const objectCenterY = y1 + (y2 - y1) / 2;
-            
-            // Calculate the distance between the hand center and the object center
-            const distancePx = Math.sqrt(
-              Math.pow(objectCenterX - handCenter.x, 2) +
-              Math.pow(objectCenterY - handCenter.y, 2)
-            );
-            const distanceCm = distancePx / PIXELS_PER_CM;
-            
-            // Draw a line between the hand center and the object center
-            ctx.strokeStyle = 'yellow';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(handCenter.x, handCenter.y);
-            ctx.lineTo(objectCenterX, objectCenterY);
-            ctx.stroke();
-            
-            // Determine the relative position of the cup with respect to the hand
-            let relativePosition = '';
-            if (Math.abs(objectCenterX - handCenter.x) < 10 && Math.abs(objectCenterY - handCenter.y) < 10) {
-              relativePosition = 'front';
-            } else if (objectCenterX < handCenter.x && Math.abs(objectCenterY - handCenter.y) < 10) {
-              relativePosition = 'left';
-            } else if (objectCenterX > handCenter.x && Math.abs(objectCenterY - handCenter.y) < 10) {
-              relativePosition = 'right';
-            } else {
-              if (objectCenterX < handCenter.x) {
-                relativePosition += 'left ';
-              } else if (objectCenterX > handCenter.x) {
-                relativePosition += 'right ';
-              }
-              if (objectCenterY < handCenter.y) {
-                relativePosition += 'up';
-              } else if (objectCenterY > handCenter.y) {
-                relativePosition += 'down';
-              }
-            }
-            
-            // Display the relative position information
-            setCupInfo(`${primaryTrack.label} is ${relativePosition.trim()} of the hand. Distance: ${distanceCm.toFixed(2)} cm. Hybrid confidence: ${blendedConfidence}%`);
-            
-            // Use text-to-speech to announce the position if the interval has passed
-            const currentTime = Date.now();
-            if (currentTime - lastSpeakTime > SPEAK_INTERVAL) {
-              speak(`${primaryTrack.label} is ${relativePosition.trim()} of the hand`);
-              lastSpeakTime = currentTime;
-            }
-            
-            console.log(`Distance between hand and ${primaryTrack.label}: ${distanceCm.toFixed(2)} cm, Position: ${relativePosition.trim()}`);
-          } else if (primaryTrack) {
-            setCupInfo(`${primaryTrack.label} detected as track #${primaryTrack.trackId} (Hybrid confidence: ${blendedConfidence}%)`);
-          } else {
-            setCupInfo('');
-          }
-        } catch (error) {
-          console.error("Detection error:", error);
-        }
-        
-        // Continue the detection loop
-        requestAnimationFrame(runDetection);
-      };
-      
-      // Start the detection loop
-      runDetection();
-      
-    } catch (err) {
-      console.error("Error accessing webcam:", err);
-      setIsLoading(false);
-      toast({
-        title: "Camera Access Denied",
-        description: "Please allow access to your camera to use this feature.",
-        variant: "destructive",
-      });
-    }
-  };
-  
   return (
-    <Layout title="Camera View">
-      <div className="space-y-6">
-        <div className="glass-card p-4 animate-fade-in">
+    <Layout title="Object Detection">
+      <div className="space-y-5">
+        <section className="glass-card p-4 md:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-wider text-muted-foreground">Input Source</p>
+              <h2 className="text-lg font-semibold">Choose Camera Mode</h2>
+            </div>
+
+            <div className="inline-flex rounded-xl bg-slate-100 p-1" role="tablist" aria-label="Camera source mode">
+              <button
+                onClick={() => setSourceMode('local')}
+                className={`px-3 py-2 rounded-lg text-sm font-medium ${sourceMode === 'local' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                disabled={cameraActive}
+              >
+                Local Camera
+              </button>
+              <button
+                onClick={() => setSourceMode('mobile')}
+                className={`px-3 py-2 rounded-lg text-sm font-medium ${sourceMode === 'mobile' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                disabled={cameraActive}
+              >
+                Mobile Relay
+              </button>
+            </div>
+          </div>
+
+          <p className="mt-2 text-sm text-slate-600">
+            Current engine: {settings.detectionEngine === 'accurate-yolo' ? 'Accurate YOLO ONNX (backend)' : 'Fast Browser Detector'}
+          </p>
+
+          {sourceMode === 'mobile' && (
+            <div className="mt-4 space-y-4 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="text-sm font-medium">
+                  Session ID
+                  <div className="mt-1 flex gap-2">
+                    <input
+                      value={mobileSessionId}
+                      onChange={(event) =>
+                        setMobileSessionId(
+                          event.target.value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12)
+                        )
+                      }
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                      disabled={cameraActive}
+                    />
+                    <button
+                      onClick={refreshSessionId}
+                      disabled={cameraActive}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                      aria-label="Generate new session id"
+                    >
+                      <SyncIcon size={14} />
+                    </button>
+                  </div>
+                </label>
+
+                <label className="text-sm font-medium">
+                  Laptop Host / IP
+                  <input
+                    value={mobileHost}
+                    onChange={(event) => setMobileHost(event.target.value)}
+                    className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm"
+                    disabled={cameraActive}
+                  />
+                </label>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3 text-xs text-slate-600 break-all">
+                {mobileCaptureUrl}
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+                {qrCodeDataUrl ? (
+                  <div className="flex items-center gap-3 rounded-lg border border-slate-200 bg-white p-3">
+                    <img
+                      src={qrCodeDataUrl}
+                      alt="QR code for mobile pairing"
+                      className="h-24 w-24 rounded-md border border-slate-200"
+                    />
+                    <p className="text-sm text-slate-600">
+                      Scan QR on phone to open relay page instantly.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex items-center rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-500">
+                    Generating pairing QR...
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={copyMobileUrl}
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100"
+                  >
+                    {copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+                    {copied ? 'Copied' : 'Copy Link'}
+                  </button>
+                  <a
+                    href={mobileCaptureUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100"
+                  >
+                    <LinkExternalIcon size={16} />
+                    Open
+                  </a>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-500">
+                Accessibility note: mobile relay keeps your phone as a camera while processing and voice guidance stays on laptop.
+              </p>
+            </div>
+          )}
+
+          <div className="mt-4 flex flex-wrap gap-3">
+            {!cameraActive ? (
+              <button
+                onClick={() => {
+                  void startSelectedSource();
+                }}
+                disabled={isLoading || !modelsLoaded}
+                className="btn-primary inline-flex min-h-12 items-center gap-2"
+                aria-label={sourceMode === 'local' ? 'Start local camera' : 'Start mobile relay'}
+              >
+                {isLoading ? <SyncIcon size={16} className="animate-spin" /> : <DeviceCameraVideoIcon size={16} />}
+                {isLoading ? 'Starting...' : sourceMode === 'local' ? 'Start Local Camera' : 'Start Mobile Relay'}
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={stopCamera}
+                  className="inline-flex min-h-12 items-center gap-2 rounded-full bg-rose-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-rose-600"
+                >
+                  <StopIcon size={16} />
+                  Turn Off Camera
+                </button>
+                <button
+                  onClick={revokeCameraAccess}
+                  className="inline-flex min-h-12 items-center gap-2 rounded-full border border-slate-300 bg-white px-5 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                >
+                  <ShieldLockIcon size={16} />
+                  Revoke Guidance
+                </button>
+              </>
+            )}
+          </div>
+        </section>
+
+        <section className="glass-card p-3 md:p-4">
           <div className="camera-container relative">
-            <video 
-              ref={videoRef} 
-              id="video" 
-              autoPlay 
-              playsInline 
-              muted 
-              className="w-full h-auto rounded-lg"
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="w-full rounded-xl bg-slate-900"
               aria-label="Camera feed"
-            ></video>
-            <canvas 
-              ref={canvasRef} 
-              id="canvas" 
-              className="absolute top-0 left-0 w-full h-full"
-              aria-hidden="true"
-            ></canvas>
-            
-            {(isLoading || isConnecting) && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 rounded-lg text-white">
-                <Loader2 className="h-10 w-10 animate-spin mb-4" />
-                <p className="text-xl font-medium">
-                  {isConnecting ? 'Establishing connection with glasses...' : 'Initializing camera...'}
-                </p>
+            />
+            <canvas ref={canvasRef} className="absolute left-0 top-0 h-full w-full" aria-hidden="true" />
+
+            {isLoading && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-950/65 text-white">
+                <SyncIcon size={24} className="mb-2 animate-spin" />
+                <p className="text-base font-medium">Initializing detection...</p>
               </div>
             )}
           </div>
-        </div>
-        
-        {!cameraActive && !isLoading && !isConnecting && (
-          <div className="flex justify-center animate-fade-in">
-            <button
-              onClick={initializeCamera}
-              disabled={!modelsLoaded}
-              className={`btn-primary flex items-center gap-2 ${!modelsLoaded ? 'opacity-50 cursor-not-allowed' : ''}`}
-              aria-label="Establish connection with glasses"
-            >
-              {!modelsLoaded && <Loader2 className="h-4 w-4 animate-spin" />}
-              Establish Connection with Glasses
-            </button>
-          </div>
-        )}
-        
-        <div className="glass-card p-4 animate-fade-in">
-          <h2 className="font-semibold mb-2">Detection Status</h2>
-          <p id="movement" className="text-sm" aria-live="polite">{detectionStatus}</p>
-          
-          {cupInfo && (
-            <div id="cup-info" className="mt-4 bg-babyBlue/10 p-3 rounded-lg text-sm" aria-live="polite">
-              {cupInfo}
-            </div>
+        </section>
+
+        <section className="glass-card p-4">
+          <h3 className="text-base font-semibold">Detection Status</h3>
+          <p className="mt-2 text-base text-slate-700" aria-live="assertive">
+            {detectionStatus}
+          </p>
+
+          {objectInfo && (
+            <p className="mt-3 rounded-lg bg-cyan-50 px-3 py-2 text-base text-cyan-900" aria-live="polite">
+              {objectInfo}
+            </p>
           )}
-        </div>
-        
-        <div className="glass-card p-4 animate-fade-in">
-          <h2 className="font-semibold mb-2">Instructions</h2>
-          <ul className="list-disc list-inside space-y-1 text-sm text-muted-foreground">
-            <li>Click "Establish Connection with Glasses" to start</li>
-            <li>Move your hand in front of the camera to see hand tracking</li>
-            <li>Point the camera at cups and other objects for detection</li>
-            <li>Audio descriptions will play when objects are detected</li>
-            <li>For best results, ensure good lighting</li>
+
+          {backendError && (
+            <p className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-800" aria-live="assertive">
+              Accurate mode warning: {backendError}
+            </p>
+          )}
+
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-sm text-slate-600">
+            <span>Permission: {permissionState}</span>
+            <span>Engine: {settings.detectionEngine === 'accurate-yolo' ? 'Accurate YOLO ONNX' : 'Fast Browser Detector'}</span>
+            <span>Confidence floor: {Math.round(objectScoreFloor * 100)}%</span>
+            {backendLatencyMs !== null && settings.detectionEngine === 'accurate-yolo' && (
+              <span>Backend latency: {backendLatencyMs} ms</span>
+            )}
+            {sourceMode === 'mobile' && <span>Last mobile frame: {mobileFrameTime || 'waiting'}</span>}
+          </div>
+        </section>
+
+        <section className="glass-card p-4">
+          <h3 className="text-base font-semibold">Minimal Accessibility Notes</h3>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-600">
+            <li>Primary actions are large, high-contrast, and always in the same position.</li>
+            <li>Status text uses plain language and live announcements for screen-reader feedback.</li>
+            <li>Fast mode prioritizes low latency; Accurate mode prioritizes object quality.</li>
           </ul>
-        </div>
+        </section>
       </div>
     </Layout>
   );

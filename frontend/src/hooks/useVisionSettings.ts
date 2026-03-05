@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 export type DetectionMode = "navigation" | "social" | "quiet";
+export type DetectionEngine = "fast-browser" | "accurate-yolo";
 
 export interface VisionSettings {
   fontSize: number;
@@ -11,6 +12,9 @@ export interface VisionSettings {
   detectionMode: DetectionMode;
   speechRate: number;
   confidenceFloor: number;
+  revealFaceNames: boolean;
+  objectConfidenceFloor: number;
+  detectionEngine: DetectionEngine;
 }
 
 const STORAGE_KEY = "vision.settings.v1";
@@ -24,6 +28,9 @@ const DEFAULT_SETTINGS: VisionSettings = {
   detectionMode: "navigation",
   speechRate: 1,
   confidenceFloor: 55,
+  revealFaceNames: false,
+  objectConfidenceFloor: 52,
+  detectionEngine: "accurate-yolo",
 };
 
 const clamp = (value: number, min: number, max: number): number => {
@@ -38,6 +45,8 @@ const sanitize = (partial: Partial<VisionSettings>): VisionSettings => {
     partial.detectionMode === "social" || partial.detectionMode === "quiet"
       ? partial.detectionMode
       : "navigation";
+  const detectionEngine: DetectionEngine =
+    partial.detectionEngine === "accurate-yolo" ? "accurate-yolo" : "fast-browser";
 
   return {
     fontSize: clamp(Number(partial.fontSize ?? DEFAULT_SETTINGS.fontSize), 12, 24),
@@ -54,6 +63,16 @@ const sanitize = (partial: Partial<VisionSettings>): VisionSettings => {
     detectionMode,
     speechRate: clamp(Number(partial.speechRate ?? DEFAULT_SETTINGS.speechRate), 0.7, 1.4),
     confidenceFloor: clamp(Number(partial.confidenceFloor ?? DEFAULT_SETTINGS.confidenceFloor), 35, 90),
+    revealFaceNames:
+      typeof partial.revealFaceNames === "boolean"
+        ? partial.revealFaceNames
+        : DEFAULT_SETTINGS.revealFaceNames,
+    objectConfidenceFloor: clamp(
+      Number(partial.objectConfidenceFloor ?? DEFAULT_SETTINGS.objectConfidenceFloor),
+      35,
+      90
+    ),
+    detectionEngine,
   };
 };
 
@@ -64,6 +83,15 @@ const loadLegacySettings = (): Partial<VisionSettings> => {
   const useReadAloud = localStorage.getItem("useReadAloud") !== "false";
   const cameraFacing =
     localStorage.getItem("cameraFacing") === "user" ? "user" : "environment";
+  const revealFaceNames = localStorage.getItem("revealFaceNames") === "true";
+  const objectConfidenceFloor = Number(
+    localStorage.getItem("objectConfidenceFloor") || DEFAULT_SETTINGS.objectConfidenceFloor
+  );
+  const storedDetectionEngine = localStorage.getItem("detectionEngine");
+  const detectionEngine: DetectionEngine =
+    storedDetectionEngine === "accurate-yolo" || storedDetectionEngine === "fast-browser"
+      ? storedDetectionEngine
+      : DEFAULT_SETTINGS.detectionEngine;
 
   return {
     fontSize,
@@ -71,6 +99,9 @@ const loadLegacySettings = (): Partial<VisionSettings> => {
     speakDetections,
     useReadAloud,
     cameraFacing,
+    revealFaceNames,
+    objectConfidenceFloor,
+    detectionEngine,
   };
 };
 
@@ -103,6 +134,9 @@ const persistSettings = (settings: VisionSettings): void => {
   localStorage.setItem("speakDetections", String(settings.speakDetections));
   localStorage.setItem("useReadAloud", String(settings.useReadAloud));
   localStorage.setItem("cameraFacing", settings.cameraFacing);
+  localStorage.setItem("revealFaceNames", String(settings.revealFaceNames));
+  localStorage.setItem("objectConfidenceFloor", String(settings.objectConfidenceFloor));
+  localStorage.setItem("detectionEngine", settings.detectionEngine);
 };
 
 export const useVisionSettings = () => {

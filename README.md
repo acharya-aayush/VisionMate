@@ -1,135 +1,69 @@
 # VisionMate
 
-SXC Sandbox 2.0 Hackathon Winner
+## Overview
+VisionMate is a browser-based vision assistant with a React frontend and a FastAPI backend.
+The codebase implements separate pipelines for face recognition and object detection.
 
-Team: JPT Coders
+## Core Functional Modules
+- Face recognition module: stable
+	- LBPH face recognition runs on the backend and is exposed through HTTP and WebSocket endpoints.
+- Object detection module: partially working
+	- Two paths exist: browser detection (TensorFlow.js) and backend detection (YOLO ONNX).
+	- Backend accurate mode can return runtime errors if model export/inference dependencies are not fully available.
+- Audio feedback module: partially working
+	- Uses browser SpeechSynthesis API in frontend pages.
+	- Behavior depends on browser support and user permission state.
+- Camera / QR module: experimental
+	- Local camera mode and mobile relay mode are implemented.
+	- Mobile relay relies on same-network routing, session IDs, and short-lived in-memory frame storage.
 
-![MIT License](https://img.shields.io/badge/license-MIT-green)
-![Winner](https://img.shields.io/badge/sxc%20sandbox%202.0-winner-blue)
-![Python](https://img.shields.io/badge/python-3.10+-blue)
-![React](https://img.shields.io/badge/frontend-react%20%7C%20vite%20%7C%20ts-blue)
+## System Architecture (High Level)
+- Frontend (React + Vite) handles camera input, rendering overlays, and speech output.
+- Backend (FastAPI) handles face recognition, user registration/training, object detection, and relay endpoints.
+- Frontend communicates with backend over HTTP (`/recognize-base64`, `/object-detect-base64`, relay endpoints) and optional WebSocket (`/ws/recognize`).
 
-**Team Members:**
-- [Aayush Acharya](https://www.linkedin.com/in/acharyaaayush/) ([email](mailto:acharyaaayush2k4@gmail.com), [instagram](https://www.instagram.com/acharya.404/))
-- Aaryan Bista
-- Binish Shrestha
-- Devesh Phaiju
+## Tech Stack
+- Backend: Python, FastAPI, Uvicorn, OpenCV (opencv-contrib-python), NumPy, Pillow, Ultralytics, ONNX Runtime
+- Frontend: React, TypeScript, Vite, TensorFlow.js (CDN scripts), ONNX Runtime Web, React Router, TanStack Query
 
-## About
+## Setup Instructions
 
-Face recognition system for visually impaired assistance.
+Backend:
+1. `cd backend`
+2. `python -m venv venv`
+3. `venv\Scripts\activate`
+4. `pip install -r requirements.txt`
+5. `python -m uvicorn face_recognition_api:app --host 0.0.0.0 --port 8000`
 
-**Tech Stack:**
-- Backend: Python, FastAPI, OpenCV
-- Algorithm: LBPH Face Recognizer
-- Frontend: React, Vite, TypeScript, TensorFlow.js
-- Accuracy: 40-70%
+Frontend:
+1. `cd frontend`
+2. `npm install`
+3. `npm run dev`
 
-## Quick Start
+Environment requirements:
+- Python runtime: UNVERIFIED FROM CODEBASE
+- Node.js runtime: UNVERIFIED FROM CODEBASE
+- Browser with camera access and SpeechSynthesis support for full frontend behavior
 
-### Prerequisites
-- Python 3.10 or higher
-- Node.js 18+
-- Git
+## API Summary
+- `GET /`: service health response
+- `GET /network-info`: LAN IP candidates for mobile relay pairing
+- `GET /users`: list registered user IDs/names
+- `DELETE /users/{user_id}`: remove user mapping and dataset folder, then retrain
+- `POST /recognize-base64`: detect and recognize faces from base64 image
+- `POST /register-base64`: add user face from base64 image and retrain
+- `POST /mobile-stream/{session_id}/frame`: upload latest mobile frame
+- `GET /mobile-stream/{session_id}/latest`: fetch latest mobile frame for session
+- `POST /object-detect-base64`: run YOLO ONNX object detection on base64 image
+- `POST /train`: retrain LBPH model with dataset images
+- `WS /ws/recognize`: receive base64 frames and return recognition result stream
 
-### Option 1: Automated Setup (Recommended)
+## Limitations
+- Object detection has known runtime instability when accurate backend mode dependencies are incomplete.
+- `backend/setup.bat` does not install all YOLO-related dependencies currently required by `requirements.txt`.
+- Mobile relay stores frames in process memory with short TTL and no persistence.
+- No authentication/authorization is implemented for API endpoints.
+- Production readiness characteristics (security hardening, scaling, observability) are UNVERIFIED FROM CODEBASE.
 
-Double-click `START.bat` in the root directory. This will:
-- Install all dependencies (first time only)
-- Start the backend server
-- Start the frontend dev server
-- Open the application in your default browser
-
-### Option 2: Manual Setup
-
-#### Backend Setup
-
-1. Navigate to the backend folder:
-```bash
-cd backend
-```
-
-2. Run the setup script (first time only):
-```bash
-setup.bat
-```
-
-3. Start the backend server:
-```bash
-run_server.bat
-```
-
-Backend will be running at: `http://localhost:8000`
-API Documentation: `http://localhost:8000/docs`
-
-#### Frontend Setup
-
-1. Navigate to the frontend folder:
-```bash
-cd frontend
-```
-
-2. Install dependencies (first time only):
-```bash
-npm install
-```
-
-3. Start the development server:
-```bash
-npm run dev
-```
-
-Frontend will be running at: `http://localhost:8080`
-
-## Project Structure
-
-```
-VisionMate/
-├── backend/              # Python FastAPI backend
-│   ├── face_recognition_api.py    # Main API server
-│   ├── simple_recognizer.py       # Face recognition logic
-│   ├── setup.bat                  # Setup script
-│   ├── run_server.bat             # Start server
-│   ├── requirements.txt           # Python dependencies
-│   └── dataset/                   # Training images
-├── frontend/             # React + Vite frontend
-│   ├── src/
-│   ├── package.json
-│   └── vite.config.ts
-└── START.bat            # Quick launcher
-```
-
-## Features
-
-- Real-time face recognition
-- User registration with face capture
-- Audio feedback for visually impaired users
-- Web-based interface
-- RESTful and WebSocket APIs
-
-## API Endpoints
-
-- `GET /` - Health check
-- `GET /users` - List all registered users
-- `POST /recognize-base64` - Recognize faces in image
-- `POST /register-base64` - Register new user with face
-- `POST /train` - Train the recognition model
-- `WebSocket /ws/recognize` - Real-time recognition stream
-
-## Development
-
-### Backend Only
-```bash
-cd backend
-run_server.bat
-```
-
-### Frontend Only
-```bash
-cd frontend
-npm run dev
-```
-
-## License
-
-MIT License
+## Documentation Link
+[documentation.md](documentation.md)
